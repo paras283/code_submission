@@ -1,4 +1,4 @@
-import React, { useState, useRef } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { Upload, FileCode, AlertCircle, X, CheckCircle } from "lucide-react";
 import { supabase } from "../lib/supabaseClient";
 
@@ -28,7 +28,32 @@ function SubmissionForm() {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [successMessage, setSuccessMessage] = useState<string | null>(null);
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
+    const [allowedExtensions, setAllowedExtensions] = useState<string[]>([]);
+    const [loadingExtensions, setLoadingExtensions] = useState(true);
     const fileInputRef = useRef<HTMLInputElement>(null);
+
+
+    useEffect(() => {
+        const fetchExtensions = async () => {
+            setLoadingExtensions(true);
+            const { data, error } = await supabase
+                .from("file_extensions")
+                .select("extension")
+                .eq("is_enabled", true);
+
+            if (error) {
+                console.error("Error fetching extensions:", error);
+                setAllowedExtensions([]); // clear if error
+            } else {
+                const extensions = data?.map((row) => row.extension?.toLowerCase()) ?? [];
+                setAllowedExtensions(extensions);
+            }
+            setLoadingExtensions(false);
+        };
+
+        fetchExtensions();
+    }, []);
+
 
     // ✅ Helpers
     const formatFileSize = (bytes: number): string => {
@@ -42,22 +67,27 @@ function SubmissionForm() {
     };
 
     const validateFile = (file: File): boolean => {
-        if (!file.name.endsWith(".py")) {
+        const ext = file.name.split(".").pop()?.toLowerCase();
+
+        if (!ext || !allowedExtensions.includes(ext)) {
             setErrors((prev) => ({
                 ...prev,
-                file: "Only Python (.py) files are allowed",
+                file: `Only ${allowedExtensions.join(", ")} files are allowed`,
             }));
             return false;
         }
-        if (file.size > 5 * 1024 * 1024) {
+
+        if (file.size > 2 * 1024 * 1024) {
             setErrors((prev) => ({
                 ...prev,
-                file: "File size must be less than 5MB",
+                file: "File size must be less than 2MB",
             }));
             return false;
         }
+
         return true;
     };
+
 
     const handleFileSelect = (file: File) => {
         if (validateFile(file)) {
@@ -109,7 +139,7 @@ function SubmissionForm() {
         if (!formData.name.trim()) newErrors.name = "Name is required";
         if (!formData.class.trim()) newErrors.class = "Class is required";
         if (!formData.section.trim()) newErrors.section = "Section is required";
-        if (!uploadedFile) newErrors.file = "Python file is required";
+        if (!uploadedFile) newErrors.file = "File is required";
         setErrors(newErrors);
         return Object.keys(newErrors).length === 0;
     };
@@ -126,98 +156,98 @@ function SubmissionForm() {
 
     // ✅ Submit Handler
     const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!validateForm() || !uploadedFile) return;
+        e.preventDefault();
+        if (!validateForm() || !uploadedFile) return;
 
-    setIsSubmitting(true);
-    setErrorMessage(null);
-    setSuccessMessage(null);
+        setIsSubmitting(true);
+        setErrorMessage(null);
+        setSuccessMessage(null);
 
-    try {
-        const { name, class: cls, section } = formData;
-        const fileName = uploadedFile.name;
-        const ext = fileName.split(".").pop()?.toLowerCase();
+        try {
+            const { name, class: cls, section } = formData;
+            const fileName = uploadedFile.name;
+            const ext = fileName.split(".").pop()?.toLowerCase();
 
-        // ✅ Build storage file name & folder structure
-        const storageFileName = `${name}_${cls}_${section}_${fileName}`;
-        const filePath = `${cls}/${section}/${storageFileName}`;
+            // ✅ Build storage file name & folder structure
+            const storageFileName = `${name}_${cls}_${section}_${fileName}`;
+            const filePath = `${cls}/${section}/${storageFileName}`;
 
-        // ✅ Check DB for duplicate
-        const { data: existing, error: fetchError } = await supabase
-            .from("submissions")
-            .select("id")
-            .eq("student_name", name)
-            .eq("class", cls)
-            .eq("section", section)
-            .eq("filename", fileName);
+            // ✅ Check DB for duplicate
+            const { data: existing, error: fetchError } = await supabase
+                .from("submissions")
+                .select("id")
+                .eq("student_name", name)
+                .eq("class", cls)
+                .eq("section", section)
+                .eq("filename", fileName);
 
-        if (fetchError) {
-            console.error("DB fetch error:", fetchError);
-            setErrorMessage("Failed to validate submission. Try again.");
+            if (fetchError) {
+                console.error("DB fetch error:", fetchError);
+                setErrorMessage("Failed to validate submission. Try again.");
+                setIsSubmitting(false);
+                return; // 🚨 stop
+            }
+
+            if (existing && existing.length > 0) {
+                setErrorMessage("File already exists. Contact your teacher for resubmission.");
+                setIsSubmitting(false);
+                return; // 🚨 stop
+            }
+
+            // ✅ Upload file folder-wise
+            const { error: uploadError } = await supabase.storage
+                .from("submissions")
+                .upload(filePath, uploadedFile.file, {
+                    cacheControl: "3600",
+                    upsert: false,
+                });
+
+            if (uploadError) {
+                console.error("Storage upload error:", uploadError);
+                setErrorMessage(
+                    uploadError.message.includes("exists")
+                        ? "File already exists. Contact your teacher for resubmission."
+                        : "Upload failed. Please try again."
+                );
+                setIsSubmitting(false);
+                return; // 🚨 stop
+            }
+
+            // ✅ Generate public URL manually
+            const fileURL = `${import.meta.env.VITE_SUPABASE_URL}/storage/v1/object/public/submissions/${filePath}`;
+
+            // ✅ Insert record in DB
+            const { error: insertError } = await supabase.from("submissions").insert([
+                {
+                    student_name: name,
+                    class: cls,
+                    section,
+                    filename: fileName,
+                    extension: ext,
+                    file_url: fileURL,
+                    file_path: filePath, // ✅ store path for reference
+                },
+            ]);
+
+            if (insertError) {
+                console.error("DB insert error:", insertError);
+                setErrorMessage("Upload succeeded, but saving submission failed.");
+                setIsSubmitting(false);
+                return; // 🚨 stop
+            }
+
+            // ✅ Success case only
+            setSuccessMessage("✅ Submission successful!");
+            setUploadedFile(null);
+            setFormData({ name: "", class: "", section: "" });
+            if (fileInputRef.current) fileInputRef.current.value = "";
+        } catch (err) {
+            console.error("Unexpected error:", err);
+            setErrorMessage("Upload failed. Please try again.");
+        } finally {
             setIsSubmitting(false);
-            return; // 🚨 stop
         }
-
-        if (existing && existing.length > 0) {
-            setErrorMessage("File already exists. Contact your teacher for resubmission.");
-            setIsSubmitting(false);
-            return; // 🚨 stop
-        }
-
-        // ✅ Upload file folder-wise
-        const { error: uploadError } = await supabase.storage
-            .from("submissions")
-            .upload(filePath, uploadedFile.file, {
-                cacheControl: "3600",
-                upsert: false,
-            });
-
-        if (uploadError) {
-            console.error("Storage upload error:", uploadError);
-            setErrorMessage(
-                uploadError.message.includes("exists")
-                    ? "File already exists. Contact your teacher for resubmission."
-                    : "Upload failed. Please try again."
-            );
-            setIsSubmitting(false);
-            return; // 🚨 stop
-        }
-
-        // ✅ Generate public URL manually
-        const fileURL = `${import.meta.env.VITE_SUPABASE_URL}/storage/v1/object/public/submissions/${filePath}`;
-
-        // ✅ Insert record in DB
-        const { error: insertError } = await supabase.from("submissions").insert([
-            {
-                student_name: name,
-                class: cls,
-                section,
-                filename: fileName,
-                extension: ext,
-                file_url: fileURL,
-                file_path: filePath, // ✅ store path for reference
-            },
-        ]);
-
-        if (insertError) {
-            console.error("DB insert error:", insertError);
-            setErrorMessage("Upload succeeded, but saving submission failed.");
-            setIsSubmitting(false);
-            return; // 🚨 stop
-        }
-
-        // ✅ Success case only
-        setSuccessMessage("✅ Submission successful!");
-        setUploadedFile(null);
-        setFormData({ name: "", class: "", section: "" });
-        if (fileInputRef.current) fileInputRef.current.value = "";
-    } catch (err) {
-        console.error("Unexpected error:", err);
-        setErrorMessage("Upload failed. Please try again.");
-    } finally {
-        setIsSubmitting(false);
-    }
-};
+    };
 
 
     return (
@@ -285,11 +315,10 @@ function SubmissionForm() {
                                     name="name"
                                     value={formData.name}
                                     onChange={handleInputChange}
-                                    className={`w-full px-4 py-3 rounded-lg border-2 ${
-                                        errors.name
-                                            ? "border-red-300"
-                                            : "border-gray-200"
-                                    } focus:outline-none focus:border-blue-500`}
+                                    className={`w-full px-4 py-3 rounded-lg border-2 ${errors.name
+                                        ? "border-red-300"
+                                        : "border-gray-200"
+                                        } focus:outline-none focus:border-blue-500`}
                                     placeholder="Enter your full name"
                                 />
                                 {errors.name && (
@@ -312,14 +341,13 @@ function SubmissionForm() {
                                     name="class"
                                     value={formData.class}
                                     onChange={handleInputChange}
-                                    className={`w-full px-4 py-3 rounded-lg border-2 ${
-                                        errors.class
-                                            ? "border-red-300"
-                                            : "border-gray-200"
-                                    } focus:outline-none focus:border-blue-500`}
+                                    className={`w-full px-4 py-3 rounded-lg border-2 ${errors.class
+                                        ? "border-red-300"
+                                        : "border-gray-200"
+                                        } focus:outline-none focus:border-blue-500`}
                                 >
                                     <option value="">Select Class</option>
-                                    {["6th", "7th", "8th", "9th", "10th"].map(
+                                    {["4th", "5th", "6th", "7th", "8th", "9th", "10th"].map(
                                         (c) => (
                                             <option key={c} value={c}>
                                                 {c}
@@ -347,11 +375,10 @@ function SubmissionForm() {
                                     name="section"
                                     value={formData.section}
                                     onChange={handleInputChange}
-                                    className={`w-full px-4 py-3 rounded-lg border-2 ${
-                                        errors.section
-                                            ? "border-red-300"
-                                            : "border-gray-200"
-                                    } focus:outline-none focus:border-blue-500`}
+                                    className={`w-full px-4 py-3 rounded-lg border-2 ${errors.section
+                                        ? "border-red-300"
+                                        : "border-gray-200"
+                                        } focus:outline-none focus:border-blue-500`}
                                 >
                                     <option value="">Select Section</option>
                                     {["A", "B", "C"].map((sec) => (
@@ -367,72 +394,71 @@ function SubmissionForm() {
                                 )}
                             </div>
                         </div>
-
                         {/* File Upload */}
                         <div>
                             <label className="block text-sm font-semibold text-gray-700 mb-2">
-                                Python File Upload *
+                                File Upload *
                             </label>
-                            <div
-                                className={`relative border-2 border-dashed rounded-lg p-8 text-center ${
-                                    isDragOver
-                                        ? "border-blue-400 bg-blue-50"
-                                        : errors.file
-                                        ? "border-red-300 bg-red-50"
-                                        : "border-gray-300 hover:border-blue-400 hover:bg-blue-50"
-                                }`}
-                                onDragOver={handleDragOver}
-                                onDragLeave={handleDragLeave}
-                                onDrop={handleDrop}
-                            >
-                                <input
-                                    ref={fileInputRef}
-                                    type="file"
-                                    accept=".py"
-                                    onChange={handleFileInputChange}
-                                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                                />
-                                {uploadedFile ? (
-                                    <div className="space-y-4">
-                                        <div className="flex items-center justify-center w-16 h-16 bg-green-100 rounded-full mx-auto">
-                                            <FileCode className="w-8 h-8 text-green-600" />
-                                        </div>
-                                        <p className="font-semibold">
-                                            {uploadedFile.name}
-                                        </p>
-                                        <p className="text-sm text-gray-600">
-                                            {uploadedFile.size}
-                                        </p>
-                                        <button
-                                            type="button"
-                                            onClick={removeFile}
-                                            className="text-red-600 text-sm flex items-center justify-center"
-                                        >
-                                            <X className="w-4 h-4 mr-1" /> Remove
-                                            file
-                                        </button>
-                                    </div>
-                                ) : (
-                                    <div className="space-y-4">
-                                        <div className="flex items-center justify-center w-16 h-16 bg-gray-100 rounded-full mx-auto">
-                                            <Upload className="w-8 h-8 text-gray-400" />
-                                        </div>
-                                        <p className="text-lg font-semibold text-gray-700">
-                                            Drop your Python file here
-                                        </p>
-                                        <p className="text-gray-500">
-                                            or click to browse (.py files only,
-                                            max 5MB)
-                                        </p>
-                                    </div>
-                                )}
-                            </div>
-                            {errors.file && (
-                                <p className="text-sm text-red-600 mt-2">
-                                    {errors.file}
+                            {loadingExtensions ? (
+                                <p className="text-gray-500 text-center">Loading allowed file types...</p>
+                            ) : allowedExtensions.length === 0 ? (
+                                <p className="text-red-500 text-center">
+                                    ❌ No allowed file types configured. Please contact the admin.
                                 </p>
+                            ) : uploadedFile ? (
+                                // ✅ Show selected file preview
+                                <div className="flex items-center justify-between bg-gray-100 p-4 rounded-lg border border-gray-300">
+                                    <div className="flex items-center space-x-3">
+                                        <FileCode className="text-blue-600 w-6 h-6" />
+                                        <div>
+                                            <p className="text-gray-800 font-medium">{uploadedFile.name}</p>
+                                            <p className="text-gray-500 text-sm">{uploadedFile.size}</p>
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={removeFile}
+                                        className="text-red-500 hover:text-red-700"
+                                        aria-label="Remove file"
+                                    >
+                                        <X className="w-5 h-5" />
+                                    </button>
+                                </div>
+                            ) : (
+                                // ✅ Drag & Drop area
+                                <div
+                                    className={`relative border-2 border-dashed rounded-lg p-8 text-center ${isDragOver
+                                            ? "border-blue-400 bg-blue-50"
+                                            : errors.file
+                                                ? "border-red-300 bg-red-50"
+                                                : "border-gray-300 hover:border-blue-400 hover:bg-blue-50"
+                                        }`}
+                                    onDragOver={handleDragOver}
+                                    onDragLeave={handleDragLeave}
+                                    onDrop={handleDrop}
+                                >
+                                    <input
+                                        ref={fileInputRef}
+                                        type="file"
+                                        accept={allowedExtensions.map((ext) => `.${ext}`).join(",")}
+                                        onChange={handleFileInputChange}
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                    />
+                                    <Upload className="mx-auto h-12 w-12 text-gray-400" />
+                                    <p className="mt-2 text-gray-600">
+                                        Drag and drop a file here, or click to select one.
+                                    </p>
+                                    <p className="text-sm text-gray-500 mt-1">
+                                        Allowed types:  .{allowedExtensions.join(", .").toLowerCase()} files
+                                    </p>
+                                </div>
+                            )}
+                            {errors.file && (
+                                <p className="text-sm text-red-600 mt-2">{errors.file}</p>
                             )}
                         </div>
+
+
 
                         <button
                             type="submit"

@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react'
 import { supabase } from '../src/lib/supabaseClient'
-import {User,LogOut,FileText,Users,Settings,Search,Eye,Download,Save,GraduationCap,BookOpen,
-  Star,ChevronDown,X,Menu,School,ChevronUp} from 'lucide-react'
+import {
+  User, LogOut, FileText, Users, Settings, Search, Eye, Download, Save, GraduationCap, BookOpen,
+  Star, ChevronDown, X, Menu, School, ChevronUp
+} from 'lucide-react'
 import jsPDF from 'jspdf'
 
 
@@ -13,6 +15,7 @@ interface Submission {
   filename: string;
   uploaded_at: string;
   file_path: string;
+  extension: string;
 }
 
 interface Mark {
@@ -23,6 +26,13 @@ interface Mark {
   marks: number;
   submission_id: string;
   created_at: string;
+}
+
+interface FileExtension {
+  id: string;
+  extension: string;
+  mime_type: string;
+  is_enabled: boolean;
 }
 
 export default function Admin() {
@@ -43,6 +53,7 @@ export default function Admin() {
   const [showFileSettings, setShowFileSettings] = useState(false)
   const [showPreviewModal, setShowPreviewModal] = useState(false)
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null)
+  const [fileExtensions, setFileExtensions] = useState<FileExtension[]>([]);
 
   useEffect(() => {
     getSession()
@@ -52,6 +63,7 @@ export default function Admin() {
     if (user) {
       fetchSubmissions()
       fetchMarks()
+      fetchFileExtensions();
     }
   }, [user])
 
@@ -162,20 +174,34 @@ export default function Admin() {
       if (error) {
         console.error("Error downloading file:", error.message);
         setFileContent(`⚠️ Failed to load file: ${error.message}`);
-      } else if (data) {
+        setShowPreviewModal(true);
+        return;
+      }
+
+      if (!data) return;
+
+      const ext = submission.extension?.toLowerCase();
+
+      // For text files, read as text
+      if (ext === "py" || ext === "txt" || ext === "csv" || ext === "json") {
         const text = await data.text();
         setFileContent(text);
+        setShowPreviewModal(true);
+      } else {
+        // For binary files (docx, pdf, etc.), open in a new tab
+        const url = URL.createObjectURL(data);
+        window.open(url, "_blank");
       }
     } catch (err: any) {
       console.error("Unexpected error:", err);
       setFileContent("⚠️ Unexpected error while loading file.");
+      setShowPreviewModal(true);
     }
 
     const existingMark = marks.find((m) => m.submission_id === submission.id);
     setMarkInput(existingMark ? existingMark.marks.toString() : "");
-
-    setShowPreviewModal(true);
   };
+
 
   const saveMark = async () => {
     if (!selectedSubmission || !markInput) return;
@@ -215,66 +241,137 @@ export default function Admin() {
   };
 
   const downloadFile = async (submission: Submission) => {
-    const element = document.createElement('a')
-    element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(fileContent))
-    element.setAttribute('download', submission.filename)
-    element.style.display = 'none'
-    document.body.appendChild(element)
-    element.click()
-    document.body.removeChild(element)
+    // Download the file from Supabase storage
+    const { data, error } = await supabase.storage
+      .from("submissions")
+      .download(submission.file_path); // path you saved in DB
 
-    showToast(`Downloading ${submission.filename}`)
-  }
+    if (error) {
+      console.error("Download error:", error);
+      showToast("Failed to download file");
+      return;
+    }
+
+    // Create a blob URL and trigger download
+    const url = URL.createObjectURL(data);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = submission.filename; // preserve original name
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    showToast(`Downloading ${submission.filename}`);
+  };
+
 
   const generatePDF = () => {
-    const doc = new jsPDF()
-    let yPosition = 20
+    if (filteredMarks.length === 0) {
+      showToast("No results to download for selected class/section.", "error");
+      return;
+    }
 
-    doc.setFontSize(20)
-    doc.text('Student Results Report', 20, yPosition)
-    yPosition += 15
+    const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+    const pageWidth = doc.internal.pageSize.getWidth();
+    let y = 20;
 
-    doc.setFontSize(12)
-    doc.text(`Generated on: ${new Date().toLocaleString()}`, 20, yPosition)
-    yPosition += 20
+    // Title
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(22);
+    doc.setTextColor(20, 20, 60);
+    doc.text("Student Results Report", pageWidth / 2, y, { align: "center" });
+    y += 8;
 
-    const groupedResults = marks.reduce((acc: any, mark) => {
-      const key = `Class ${mark.class} - Section ${mark.section}`
-      if (!acc[key]) acc[key] = []
-      acc[key].push(mark)
-      return acc
-    }, {})
+    // Timestamp
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    doc.setTextColor(100);
+    doc.text(`Generated on: ${new Date().toLocaleString()}`, pageWidth / 2, y, { align: "center" });
+    y += 12;
+
+    // Group by Class & Section
+    const groupedResults = filteredMarks.reduce((acc: any, mark) => {
+      const key = `Class ${mark.class} - Section ${mark.section}`;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(mark);
+      return acc;
+    }, {});
 
     Object.entries(groupedResults).forEach(([group, groupMarks]: [string, any]) => {
-      doc.setFontSize(14)
-      doc.text(group, 20, yPosition)
-      yPosition += 10
+      // Group heading
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(16);
+      doc.setTextColor(40, 40, 120);
+      y += 5;
+      doc.text(group, 14, y);
+      y += 8;
 
-      doc.setFontSize(10)
-      doc.text('Student Name', 20, yPosition)
-      doc.text('Marks', 120, yPosition)
-      yPosition += 8
+      // Table header
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(255);
+      doc.setFillColor(60, 60, 120);
+      const headerHeight = 6;
+      doc.rect(14, y - headerHeight + 1, pageWidth - 28, headerHeight, "F");
+      doc.text("Student Name", 16, y);
+      doc.text("Marks", 90, y);       // reduced gap
+      doc.text("Grade", 120, y);      // reduced gap
+      doc.text("Performance", 140, y);
+      y += headerHeight + 1;
 
-      doc.line(20, yPosition - 2, 190, yPosition - 2)
-      yPosition += 2
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(0);
 
       groupMarks.forEach((mark: Mark) => {
-        if (yPosition > 270) {
-          doc.addPage()
-          yPosition = 20
+        if (y > 280) {
+          doc.addPage();
+          y = 20;
         }
 
-        doc.text(mark.student_name, 20, yPosition)
-        doc.text(mark.marks.toString(), 120, yPosition)
-        yPosition += 8
-      })
+        const grade =
+          mark.marks >= 90 ? "A+" :
+            mark.marks >= 80 ? "A" :
+              mark.marks >= 70 ? "B" :
+                mark.marks >= 60 ? "C" : "F";
 
-      yPosition += 10
-    })
+        // Student info
+        doc.text(mark.student_name, 16, y);
+        doc.text(mark.marks.toString(), 90, y);
+        doc.text(grade, 120, y);
 
-    doc.save('student-results.pdf')
-    showToast("Student results have been downloaded as PDF.")
-  }
+        // Performance bar (rounded with gradient)
+        const barX = 140;
+        const barY = y - 4;
+        const barWidth = 50;               // total bar width
+        const fillWidth = (mark.marks / 100) * barWidth;
+        const barHeight = 6;
+
+        // Draw background bar
+        doc.setFillColor('#DCDCDC');
+        doc.roundedRect(barX, barY, barWidth, barHeight, 2, 2, "F");
+
+        // Draw filled bar with color based on grade
+        let color: [number, number, number] = [100, 180, 100]; // default green
+        if (grade === "A") color = [80, 150, 220];
+        else if (grade === "B") color = [240, 200, 50];
+        else if (grade === "C") color = [255, 140, 60];
+        else if (grade === "F") color = [220, 50, 50];
+
+        doc.setFillColor(...color);
+        doc.roundedRect(barX, barY, fillWidth, barHeight, 2, 2, "F");
+
+        y += 9;
+      });
+
+      y += 8;
+    });
+
+    doc.save("student-results.pdf");
+    showToast("Student results have been downloaded as PDF.");
+  };
+
+
 
   const filteredSubmissions = submissions.filter(submission => {
     const matchesSearch = submission.student_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -293,6 +390,44 @@ export default function Admin() {
 
   const uniqueClasses = [...new Set(submissions.map(s => s.class))]
   const uniqueSections = [...new Set(submissions.map(s => s.section))]
+
+  const fetchFileExtensions = async () => {
+    try {
+      const { data, error } = await supabase
+        .from("file_extensions")
+        .select("*")
+        .order("extension", { ascending: true });
+
+      if (error) throw error;
+      setFileExtensions(data || []);
+    } catch (error: any) {
+      showToast(error.message, "error");
+    }
+  };
+
+  const toggleExtension = async (id: string, current: boolean) => {
+    try {
+      const { error } = await supabase
+        .from("file_extensions")
+        .update({ is_enabled: !current })
+        .eq("id", id);
+
+      if (error) throw error;
+
+      setFileExtensions((prev) =>
+        prev.map((ext) =>
+          ext.id === id ? { ...ext, is_enabled: !current } : ext
+        )
+      );
+
+      showToast(`Extension updated successfully.`);
+    } catch (error: any) {
+      showToast(error.message, "error");
+    }
+  };
+
+
+
 
   if (loading) {
     return (
@@ -408,7 +543,7 @@ export default function Admin() {
       </div>
 
       {/* Sidebar */}
-      <div className={`fixed left-0 top-0 h-full w-64 bg-gray-800 border-r border-gray-700 transition-transform z-40 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+      <div className={`fixed left-0 top-0 h-full w-64 bg-gray-800 border-r border-gray-700 transition-transform z-40 overflow-y-auto scrollbar-hide ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         } lg:translate-x-0`}>
         <div className="p-6">
           <div className="flex items-center space-x-3 mb-8">
@@ -451,14 +586,24 @@ export default function Admin() {
               </button>
               {showFileSettings && (
                 <div className="pl-7 space-y-1 mt-2">
-                  <button className="w-full text-left px-4 py-2 text-sm text-gray-400 hover:text-white hover:bg-gray-700/30 rounded">
-                    Allowed Extensions
-                  </button>
-                  <button className="w-full text-left px-4 py-2 text-sm text-gray-400 hover:text-white hover:bg-gray-700/30 rounded">
-                    File Size Limits
-                  </button>
+                  <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">
+                    <div className="flex flex-wrap gap-3">
+                      {fileExtensions.map((ext) => (
+                        <button
+                          key={ext.id}
+                          onClick={() => toggleExtension(ext.id, ext.is_enabled)}
+                          className={`text-sm font-medium transition-colors ${ext.is_enabled ? "text-green-400" : "text-gray-400 hover:text-gray-200"
+                            }`}
+                        >
+                          .{ext.extension}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               )}
+
+
             </div>
 
             <div className="border-t border-gray-700 my-4"></div>
